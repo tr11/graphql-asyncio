@@ -1,6 +1,8 @@
 from collections import OrderedDict
 
-from rx import Observable
+from aioreactive.core import AsyncObservable, AsyncAnonymousObserver
+from graphql.execution.executors.asyncio import AsyncioExecutor
+import asyncio
 from pytest import raises
 
 from graphql import graphql
@@ -72,7 +74,7 @@ SubscriptionType = GraphQLObjectType(
             args={
                 'color': GraphQLArgument(ColorType)
             },
-            resolver=lambda value, info, **args: Observable.from_(
+            resolver=lambda value, info, **args: AsyncObservable.from_iterable(
                 [args.get('color')])
         )
     }
@@ -151,10 +153,18 @@ def test_accepts_enum_literals_as_input_arguments_to_mutations():
 def test_accepts_enum_literals_as_input_arguments_to_subscriptions():
     result = graphql(
         Schema, 'subscription x($color: Color!) { subscribeToEnum(color: $color) }', variable_values={
-            'color': 'GREEN'}, allow_subscriptions=True)
-    assert isinstance(result, Observable)
+            'color': 'GREEN'}, allow_subscriptions=True, executor=AsyncioExecutor())
+    assert isinstance(result, AsyncObservable)
     l = []
-    result.subscribe(l.append)
+
+    async def p_subscribe(list_, stream_):
+        from aioreactive.core import subscribe
+        async def append(x):
+            list_.append(x)
+        obv = AsyncAnonymousObserver(append)
+        await subscribe(stream_, obv)
+
+    asyncio.get_event_loop().run_until_complete(asyncio.ensure_future(p_subscribe(l, result)))
     result = l[0]
     assert not result.errors
     assert result.data == {'subscribeToEnum': 'GREEN'}

@@ -4,7 +4,6 @@ from promise.dataloader import DataLoader
 
 from graphql import GraphQLObjectType, GraphQLField, GraphQLID, GraphQLArgument, GraphQLNonNull, GraphQLSchema, parse, execute
 from graphql.execution.executors.sync import SyncExecutor
-from graphql.execution.executors.thread import ThreadExecutor
 
 
 @pytest.mark.parametrize("executor", [
@@ -63,7 +62,7 @@ def test_batches_correctly(executor):
             'id': '2'
         },
     }
-    assert load_calls == [['1','2']]
+    assert load_calls == [['1'], ['2']]
 
 
 @pytest.mark.parametrize("executor", [
@@ -115,14 +114,14 @@ def test_batches_multiple_together(executor):
 
 
     business_load_calls = []
-    
+
     class BusinessDataLoader(DataLoader):
         def batch_load_fn(self, keys):
             business_load_calls.append(keys)
             return Promise.resolve(keys)
 
     location_load_calls = []
-    
+
     class LocationDataLoader(DataLoader):
         def batch_load_fn(self, keys):
             location_load_calls.append(keys)
@@ -149,5 +148,5 @@ def test_batches_multiple_together(executor):
             }
         },
     }
-    assert business_load_calls == [['1','2']]
-    assert location_load_calls == [['location-1','location-2']]
+    assert business_load_calls == [['1'], ['2']]
+    assert location_load_calls == [['location-1'], ['location-2']]

@@ -2,7 +2,9 @@ import collections
 import functools
 import logging
 import sys
-from rx import Observable
+
+from aioreactive.core import AsyncObservable, Operators as op
+from aioreactive.operators.catch_exception import catch_exception
 
 from six import string_types
 from promise import Promise, promise_for_dict, is_thenable
@@ -36,7 +38,6 @@ def execute(schema, document_ast, root_value=None, context_value=None,
         'Schema must be an instance of GraphQLSchema. Also ensure that there are ' +
         'not multiple versions of GraphQL installed in your node_modules directory.'
     )
-
     if middleware:
         if not isinstance(middleware, MiddlewareManager):
             middleware = MiddlewareManager(*middleware)
@@ -61,6 +62,8 @@ def execute(schema, document_ast, root_value=None, context_value=None,
         allow_subscriptions
     )
 
+    _executor = executor
+
     def executor(v):
         return execute_operation(context, context.operation, root_value)
 
@@ -69,21 +72,29 @@ def execute(schema, document_ast, root_value=None, context_value=None,
         return None
 
     def on_resolve(data):
-        if isinstance(data, Observable):
+        if isinstance(data, AsyncObservable):
             return data
 
         if not context.errors:
             return ExecutionResult(data=data)
-
         return ExecutionResult(data=data, errors=context.errors)
 
-    promise = Promise.resolve(None).then(executor).catch(on_rejected).then(on_resolve)
+    if return_promise:
+        return Promise.resolve(None).then(executor).catch(on_rejected).then(on_resolve)
 
-    if not return_promise:
-        context.executor.wait_until_finished()
-        return promise.get()
+    try:
+        data = executor(None)
+    except Exception as e:
+        data = on_rejected(e)
 
-    return promise
+    if isinstance(data, Promise):
+        if isinstance(_executor, SyncExecutor):
+            return data.catch(on_rejected).then(on_resolve).get()
+        return _executor.loop.run_until_complete(
+            data.catch(on_rejected).then(on_resolve)
+        )
+
+    return on_resolve(data)
 
 
 def execute_operation(exe_context, operation, root_value):
@@ -167,6 +178,7 @@ def subscribe_fields(exe_context, parent_type, source_value, fields):
         exe_context.report_error(error)
 
     def map_result(data):
+        print("MAP RESULT:", data)
         if exe_context.errors:
             result = ExecutionResult(data=data, errors=exe_context.errors)
         else:
@@ -174,27 +186,25 @@ def subscribe_fields(exe_context, parent_type, source_value, fields):
         exe_context.reset()
         return result
 
-    observables = []
+    # def catch_error(error):
+    #     print("CATCH ERROR:", error)
+    #     exe_context.errors.append(error)
+    #     return None
 
-    # assert len(fields) == 1, "Can only subscribe one element at a time."
-
+    assert len(fields) == 1, "Can only subscribe one element at a time."
     for response_name, field_asts in fields.items():
 
         result = subscribe_field(exe_context, parent_type, source_value, field_asts)
         if result is Undefined:
             continue
 
-        def catch_error(error):
-            exe_context.errors.append(error)
-            return Observable.just(None)
-
         # Map observable results
-        observable = result.catch_exception(catch_error).map(
-            lambda data: map_result({response_name: data}))
-        return observable
-        observables.append(observable)
-
-    return Observable.merge(observables)
+        # error_obs = AsyncObservable.unit(None) | op.map(catch_error)
+        obs = result | op.map(lambda x: {response_name: x}) | op.map(map_result)
+        return obs
+        # print("ERROR OBS:", error_obs)
+        # print("REGULAR OBS:", obs)
+        # return catch_exception([obs, error_obs])  # error with aioreactive?
 
 
 def resolve_field(exe_context, parent_type, source, field_asts, parent_info):
@@ -288,23 +298,23 @@ def subscribe_field(exe_context, parent_type, source, field_asts):
     )
 
     executor = exe_context.executor
+    if isinstance(executor, SyncExecutor):
+        raise TypeError("Cannot use subscriptions with the SyncExecutor")
+
     result = resolve_or_error(resolve_fn_middleware,
                               source, info, args, executor)
 
     if isinstance(result, Exception):
         raise result
 
-    if not isinstance(result, Observable):
-        raise GraphQLError(
-            'Subscription must return Async Iterable or Observable. Received: {}'.format(repr(result)))
+    if isinstance(result, Promise):
+        result = executor.loop.run_until_complete(result)
 
-    return result.map(functools.partial(
-        complete_value_catching_error,
-        exe_context,
-        return_type,
-        field_asts,
-        info,
-    ))
+    if not isinstance(result, AsyncObservable):
+        raise GraphQLError(
+            'Subscription must return an AsyncObservable. Received: {}'.format(repr(result)))
+
+    return result | op.map(functools.partial(complete_value_catching_error, exe_context, return_type, field_asts, info))
 
 
 def resolve_or_error(resolve_fn, source, info, args, executor):
@@ -364,6 +374,7 @@ def complete_value(exe_context, return_type, field_asts, info, result):
     """
     # If field type is NonNull, complete for inner type, and throw field error
     # if result is null.
+
     if is_thenable(result):
         return Promise.resolve(result).then(
             lambda resolved: complete_value(

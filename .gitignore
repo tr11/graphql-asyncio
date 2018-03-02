@@ -66,3 +66,7 @@ target/
 
 # OS X
 .DS_Store
+
+
+.pytest*
+cover

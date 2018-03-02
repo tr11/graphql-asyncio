@@ -1,5 +1,6 @@
 import json
 
+from aioreactive.core import AsyncAnonymousObserver
 from pytest import raises
 
 from graphql.error import GraphQLError
@@ -380,7 +381,9 @@ def test_uses_the_mutation_schema_for_queries():
 
 
 def test_uses_the_subscription_schema_for_subscriptions():
-    from rx import Observable
+    from graphql.execution.executors.asyncio import AsyncioExecutor
+    from aioreactive.core import AsyncObservable
+    import asyncio
     doc = 'query Q { a } subscription S { a }'
 
     class Data(object):
@@ -392,13 +395,22 @@ def test_uses_the_subscription_schema_for_subscriptions():
         'a': GraphQLField(GraphQLString)
     })
     S = GraphQLObjectType('S', {
-        'a': GraphQLField(GraphQLString, resolver=lambda root, info: Observable.from_(['b']))
+        'a': GraphQLField(GraphQLString, resolver=lambda root, info: AsyncObservable.from_iterable(['b']))
     })
     result = execute(GraphQLSchema(Q, subscription=S),
-                     ast, Data(), operation_name='S', allow_subscriptions=True)
-    assert isinstance(result, Observable)
+                     ast, Data(), operation_name='S', allow_subscriptions=True,
+                     executor=AsyncioExecutor())
+    assert isinstance(result, AsyncObservable)
     l = []
-    result.subscribe(l.append)
+
+    async def p_subscribe(list_, stream_):
+        from aioreactive.core import subscribe
+        async def append(x):
+            list_.append(x)
+        obv = AsyncAnonymousObserver(append)
+        await subscribe(stream_, obv)
+
+    asyncio.get_event_loop().run_until_complete(asyncio.ensure_future(p_subscribe(l, result)))
     result = l[0]
     assert not result.errors
     assert result.data == {'a': 'b'}

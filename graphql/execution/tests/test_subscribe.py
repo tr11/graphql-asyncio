@@ -1,7 +1,11 @@
+import asyncio
 from collections import OrderedDict, namedtuple
-from rx import Observable, Observer
-from rx.subjects import Subject
-from graphql import parse, GraphQLObjectType, GraphQLString, GraphQLBoolean, GraphQLInt, GraphQLField, GraphQLList, GraphQLSchema, graphql, subscribe
+
+from aioreactive.core import AsyncObservable, AsyncSingleStream, AsyncIteratorObserver, AsyncAnonymousObserver
+from aioreactive.testing.streams import AsyncMultipleStream
+from graphql import parse, GraphQLObjectType, GraphQLString, GraphQLBoolean, GraphQLInt,\
+    GraphQLField, GraphQLList, GraphQLSchema, graphql, subscribe
+from graphql.execution.executors.asyncio import AsyncioExecutor
 
 Email = namedtuple('Email', 'from_,subject,message,unread')
 
@@ -56,7 +60,7 @@ def email_schema_with_resolvers(resolve_fn=None):
         if func:
             func = get_unbound_function(func)
             return func()
-        return Observable.empty()
+        return AsyncObservable.empty()
 
     return GraphQLSchema(
         query=QueryType,
@@ -75,18 +79,7 @@ def email_schema_with_resolvers(resolve_fn=None):
 email_schema = email_schema_with_resolvers()
 
 
-class MyObserver(Observer):
-    def on_next(self, value):
-        self.has_on_next = value
-
-    def on_error(self, err):
-        self.has_on_error = err
-
-    def on_completed(self):
-        self.has_on_completed = True
-
-
-def create_subscription(stream, schema=email_schema, ast=None, vars=None):
+def create_subscription(stream, schema=email_schema, ast=None, vars=None, disconnect=True):
     class Root(object):
         class inbox(object):
             emails = [
@@ -101,10 +94,11 @@ def create_subscription(stream, schema=email_schema, ast=None, vars=None):
         def importantEmail():
             return stream
 
-    def send_important_email(new_email):
+    async def send_important_email(new_email):
         Root.inbox.emails.append(new_email)
-        stream.on_next((new_email, Root.inbox))
-        # stream.on_completed()
+        await stream.asend((new_email, Root.inbox))
+        if disconnect:
+            await stream.aclose()
 
     default_ast = parse('''
     subscription {
@@ -119,7 +113,7 @@ def create_subscription(stream, schema=email_schema, ast=None, vars=None):
         }
       }
     }
-  ''')
+    ''')
 
     return send_important_email, graphql(
         schema,
@@ -128,7 +122,17 @@ def create_subscription(stream, schema=email_schema, ast=None, vars=None):
         None,
         vars,
         allow_subscriptions=True,
+        executor=AsyncioExecutor(),
     )
+
+
+async def p_subscribe(list_, stream_):
+    from aioreactive.core import subscribe
+    async def append(x):
+        list_.append(x)
+    obv = AsyncAnonymousObserver(append)
+    await subscribe(stream_, obv)
+
 
 
 def test_accepts_an_object_with_named_properties_as_arguments():
@@ -140,9 +144,10 @@ def test_accepts_an_object_with_named_properties_as_arguments():
     result = subscribe(
         email_schema,
         document,
+        executor=AsyncioExecutor(),
         root_value=None
     )
-    assert isinstance(result, Observable)
+    assert isinstance(result, AsyncObservable)
 
 
 def test_accepts_multiple_subscription_fields_defined_in_schema():
@@ -158,7 +163,7 @@ def test_accepts_multiple_subscription_fields_defined_in_schema():
         subscription=SubscriptionTypeMultiple
     )
 
-    stream = Subject()
+    stream = AsyncSingleStream()
     send_important_email, subscription = create_subscription(
         stream, test_schema)
 
@@ -169,8 +174,11 @@ def test_accepts_multiple_subscription_fields_defined_in_schema():
         unread=True,
     )
     l = []
-    stream.subscribe(l.append)
-    send_important_email(email)
+
+    fut1 = asyncio.ensure_future(p_subscribe(l, stream))
+    fut2 = asyncio.ensure_future(send_important_email(email))
+
+    asyncio.get_event_loop().run_until_complete(asyncio.gather(fut1, fut2))
     assert l[0][0] == email
 
 
@@ -179,7 +187,7 @@ def test_accepts_type_definition_with_sync_subscribe_function():
         name='Subscription',
         fields=OrderedDict([
             ('importantEmail', GraphQLField(
-                EmailEventType, resolver=lambda *_: Observable.from_([None]))),
+                EmailEventType, resolver=lambda *_: AsyncObservable.from_iterable([None]))),
         ])
     )
     test_schema = GraphQLSchema(
@@ -187,7 +195,7 @@ def test_accepts_type_definition_with_sync_subscribe_function():
         subscription=SubscriptionType
     )
 
-    stream = Subject()
+    stream = AsyncSingleStream()
     send_important_email, subscription = create_subscription(
         stream, test_schema)
 
@@ -198,8 +206,11 @@ def test_accepts_type_definition_with_sync_subscribe_function():
         unread=True,
     )
     l = []
-    subscription.subscribe(l.append)
-    send_important_email(email)
+
+    fut1 = asyncio.ensure_future(p_subscribe(l, stream))
+    fut2 = asyncio.ensure_future(send_important_email(email))
+
+    asyncio.get_event_loop().run_until_complete(asyncio.gather(fut1, fut2))
 
     assert l  # [0].data == {'importantEmail': None}
 
@@ -217,18 +228,18 @@ def test_throws_an_error_if_subscribe_does_not_return_an_iterator():
         subscription=SubscriptionType
     )
 
-    stream = Subject()
+    stream = AsyncSingleStream()
     _, subscription = create_subscription(
         stream, test_schema)
 
     assert str(
-        subscription.errors[0]) == 'Subscription must return Async Iterable or Observable. Received: None'
+        subscription.errors[0]) == 'Subscription must return an AsyncObservable. Received: None'
 
 
 def test_returns_an_error_if_subscribe_function_returns_error():
     exc = Exception("Throw!")
 
-    def thrower(root, info):
+    async def thrower(root, info):
         raise exc
 
     erroring_email_schema = email_schema_with_resolvers(thrower)
@@ -236,22 +247,24 @@ def test_returns_an_error_if_subscribe_function_returns_error():
         subscription {
           importantEmail
         }
-    '''))
+    '''),
+        executor=AsyncioExecutor(),
+    )
 
     assert result.errors == [exc]
 
 
 # Subscription Publish Phase
 def test_produces_a_payload_for_multiple_subscribe_in_same_subscription():
-    stream = Subject()
-    send_important_email, subscription1 = create_subscription(stream)
-    subscription2 = create_subscription(stream)[1]
+    stream = AsyncMultipleStream()
+    send_important_email, subscription1 = create_subscription(stream, disconnect=False)
+    subscription2 = create_subscription(stream, disconnect=False)[1]
 
     payload1 = []
     payload2 = []
 
-    subscription1.subscribe(payload1.append)
-    subscription2.subscribe(payload2.append)
+    fut1 = asyncio.ensure_future(p_subscribe(payload1, subscription1))
+    fut2 = asyncio.ensure_future(p_subscribe(payload2, subscription2))
 
     email = Email(
         from_='yuzhi@graphql.org',
@@ -260,7 +273,9 @@ def test_produces_a_payload_for_multiple_subscribe_in_same_subscription():
         unread=True,
     )
 
-    send_important_email(email)
+    fut = asyncio.ensure_future(send_important_email(email))
+    asyncio.get_event_loop().run_until_complete(fut)
+
     expected_payload = {
         'importantEmail': {
             'email': {
@@ -280,18 +295,20 @@ def test_produces_a_payload_for_multiple_subscribe_in_same_subscription():
 
 # Subscription Publish Phase
 def test_produces_a_payload_per_subscription_event():
-    stream = Subject()
-    send_important_email, subscription = create_subscription(stream)
+    stream = AsyncSingleStream()
+    send_important_email, subscription = create_subscription(stream, disconnect=False)
 
     payload = []
 
-    subscription.subscribe(payload.append)
-    send_important_email(Email(
-        from_='yuzhi@graphql.org',
-        subject='Alright',
-        message='Tests are good',
-        unread=True,
-    ))
+    fut1 = asyncio.ensure_future(p_subscribe(payload, subscription))
+    fut = asyncio.ensure_future(
+        send_important_email(Email(
+            from_='yuzhi@graphql.org',
+            subject='Alright',
+            message='Tests are good',
+            unread=True,
+        ))
+    )
     expected_payload = {
         'importantEmail': {
             'email': {
@@ -304,16 +321,19 @@ def test_produces_a_payload_per_subscription_event():
             },
         }
     }
+    asyncio.get_event_loop().run_until_complete(asyncio.gather(fut1, fut))
 
     assert len(payload) == 1
     assert payload[0].data == expected_payload
 
-    send_important_email(Email(
-        from_='hyo@graphql.org',
-        subject='Tools',
-        message='I <3 making things',
-        unread=True,
-    ))
+    fut = asyncio.ensure_future(
+        send_important_email(Email(
+            from_='hyo@graphql.org',
+            subject='Tools',
+            message='I <3 making things',
+            unread=True,
+        ))
+    )
     expected_payload = {
         'importantEmail': {
             'email': {
@@ -327,41 +347,52 @@ def test_produces_a_payload_per_subscription_event():
         }
     }
 
+    asyncio.get_event_loop().run_until_complete(asyncio.gather(fut1, fut))
+
     assert len(payload) == 2
     assert payload[-1].data == expected_payload
 
     # The client decides to disconnect
-    stream.on_completed()
+    asyncio.get_event_loop().run_until_complete(stream.aclose())
 
-    send_important_email(Email(
+    fut = asyncio.ensure_future(send_important_email(Email(
         from_='adam@graphql.org',
         subject='Important',
         message='Read me please',
         unread=True,
-    ))
+    )))
 
+    asyncio.get_event_loop().run_until_complete(asyncio.gather(fut1, fut))
     assert len(payload) == 2
 
 
 def test_event_order_is_correct_for_multiple_publishes():
-    stream = Subject()
-    send_important_email, subscription = create_subscription(stream)
+    stream = AsyncSingleStream()
+    send_important_email, subscription = create_subscription(stream, disconnect=False)
 
     payload = []
 
-    subscription.subscribe(payload.append)
-    send_important_email(Email(
-        from_='yuzhi@graphql.org',
-        subject='Message',
-        message='Tests are good',
-        unread=True,
-    ))
-    send_important_email(Email(
-        from_='yuzhi@graphql.org',
-        subject='Message 2',
-        message='Tests are good 2',
-        unread=True,
-    ))
+    fut1 = asyncio.ensure_future(p_subscribe(payload, subscription))
+    fut2 = asyncio.ensure_future(
+        send_important_email(Email(
+            from_='yuzhi@graphql.org',
+            subject='Message',
+            message='Tests are good',
+            unread=True,
+        ))
+    )
+    fut3 = asyncio.ensure_future(
+        send_important_email(Email(
+            from_='yuzhi@graphql.org',
+            subject='Message 2',
+            message='Tests are good 2',
+            unread=True,
+        ))
+    )
+
+    asyncio.get_event_loop().run_until_complete(fut2)
+    asyncio.get_event_loop().run_until_complete(fut3)
+    asyncio.get_event_loop().run_until_complete(stream.aclose())
 
     expected_payload1 = {
         'importantEmail': {

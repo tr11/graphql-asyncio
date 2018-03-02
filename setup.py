@@ -24,7 +24,7 @@ sys.path[:] = path_copy
 install_requires = [
     'six>=1.10.0',
     'promise>=2.1',
-    'rx>=1.6.0',
+    'aioreactive>=0.5.0'
 ]
 
 tests_requires = [
@@ -32,7 +32,6 @@ tests_requires = [
     'pytest-django==2.9.1',
     'pytest-cov==2.3.1',
     'coveralls',
-    'gevent==1.1rc1',
     'six>=1.10.0',
     'pytest-benchmark==3.0.0',
     'pytest-mock==1.2',
@@ -53,7 +52,7 @@ class PyTest(TestCommand):
 
 
 setup(
-    name='graphql-core',
+    name='graphql-async',
     version=version,
     description='GraphQL implementation for Python',
     url='https://github.com/graphql-python/graphql-core',

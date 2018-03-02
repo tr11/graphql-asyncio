@@ -151,6 +151,8 @@ class ExecutionResult(object):
             )
         )
 
+    def __repr__(self):
+        return '<ExecutionResult {}>'.format(dict((k, self.__getattribute__(k)) for k in self.__slots__  if self.__getattribute__(k) is not None))
 
 def get_operation_root_type(schema, operation):
     op = operation.operation
